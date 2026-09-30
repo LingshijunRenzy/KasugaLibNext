@@ -24,9 +24,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *     framework later (asset reload, config) have somewhere to report without reshaping the outlet.</li>
  * </ul>
  *
- * <p>Nothing here throws: diagnostics must never be able to turn a recoverable load failure into a
- * crash, and the bucket must stay readable even while a load is in flight (buckets are per key and
- * individually synchronized).
+ * <p>Reporting never aborts a load: a failure handed in is recorded, never rethrown, and the buckets
+ * stay readable while a load is in flight (per key, individually synchronized). Null arguments are
+ * rejected up front — that is a programming error, not load data.
  */
 public final class Diagnostics {
 

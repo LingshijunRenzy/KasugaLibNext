@@ -1,6 +1,0 @@
-{
-  "id": "test:broken",
-  "layers": [
-    { "id": "no_initial_state" }
-  ]
-}

@@ -33,6 +33,11 @@ public class JsonTreeBuilder {
     private static final Gson GSON = new Gson();
     private static boolean handlersRegistered = false;
 
+    /** Index-manifest field naming the content files consumed during registration. */
+    private static final String ON_REGISTER = "on_register";
+    /** Index-manifest field naming the content files consumed during a resource reload. */
+    private static final String ON_RELOAD = "on_reload";
+
     /**
      * Loading errors bucketed by mod id. A bucket per mod means that a later
      * {@link #buildForMod(String)} call for another mod can no longer erase the diagnostics raised
@@ -61,8 +66,8 @@ public class JsonTreeBuilder {
                 String msg = "Mod '" + modId + "' still ships the deprecated data-driven layout at "
                         + "'data/" + modId + "/kasugalib/' (" + legacyDir + "), which is no longer read. "
                         + "Migrate the content files and add an index manifest at "
-                        + "'data/" + modId + "/kasuga_lib/data_driven/<name>.json' that lists them in a "
-                        + "\"sources\" array (paths relative to 'data/" + modId + "/').";
+                        + "'data/" + modId + "/kasuga_lib/data_driven/<name>.json' that lists them in an "
+                        + "\"on_register\" array (paths relative to 'data/" + modId + "/').";
                 LOGGER.warn(msg);
                 addLoadingError(modId, new IllegalStateException(msg));
             } else {
@@ -76,21 +81,30 @@ public class JsonTreeBuilder {
             loc -> ResourceLocation.fromNamespaceAndPath(modId, loc.getPath()));
         RegBuildContext context = new RegBuildContext(modId, rootGroup);
 
-        // Index files are pure manifests: each lists content files via its "sources" array.
-        // Every content file is parsed at most once, even if referenced from several manifests.
-        Map<TypeHandler<?>, List<ParsedEntry>> parsed = new LinkedHashMap<>();
-        Set<String> parsedSources = new HashSet<>();
+        // Index files are pure manifests: each lists content files per domain through its
+        // "on_register" and "on_reload" arrays. Every manifest is read before anything is consumed
+        // so a path listed in both domains can be rejected fail-closed (D6); each content file is
+        // then parsed at most once per mod, even if referenced from several manifests.
+        List<IndexManifest> manifests = new ArrayList<>();
         for (Path path : listIndexFiles(indexDir, modId)) {
-            parseIndexFile(path, modId, parsedSources, parsed);
+            manifests.add(readIndexManifest(path, modId));
+        }
+        ResolvedIndex index = resolveIndexManifests(modId, manifests);
+
+        if (index.nothingDeclared()) {
+            return null;
+        }
+        if (!index.declaredOnRegister()) {
+            LOGGER.info("Data-driven index for mod '{}' declares no 'on_register' entries; nothing to register",
+                    modId);
         }
 
-        if (parsed.isEmpty()) {
-            String msg = "Data-driven index directory for mod '" + modId + "' exists (" + indexDir
-                    + ") but no entries were loaded; expected at least one content file listed by a "
-                    + "manifest's \"sources\" array";
-            LOGGER.warn(msg);
-            addLoadingError(modId, new IllegalStateException(msg));
-            return null;
+        // Registration consumes only 'on_register'; 'on_reload' is recognised but read by the reload
+        // side, so it was already validated and cross-checked above without being parsed here.
+        Map<TypeHandler<?>, List<ParsedEntry>> parsed = new LinkedHashMap<>();
+        Set<String> parsedSources = new HashSet<>();
+        for (String sourcePath : index.onRegisterPaths()) {
+            parseSource(modId, sourcePath, parsedSources, parsed);
         }
 
         int totalEntries = parsed.values().stream().mapToInt(List::size).sum();
@@ -163,48 +177,190 @@ public class JsonTreeBuilder {
     }
 
     /**
-     * Parses one index file. An index file is a pure manifest: its only supported top-level field is
-     * {@code sources}, an array of content-file paths (each relative to {@code data/<mod>/} and
-     * including the {@code .json} suffix). The index does not name any registration type.
+     * Reads one index manifest from disk and parses it with
+     * {@link #parseIndexManifest(String, String, JsonObject)}. A file that cannot be read or is not
+     * valid JSON is reported and treated as declaring nothing, so it does not abort the other
+     * manifests of the same mod.
      */
-    private static void parseIndexFile(Path path, String modId, Set<String> parsedSources,
-                                       Map<TypeHandler<?>, List<ParsedEntry>> parsed) {
+    private static IndexManifest readIndexManifest(Path path, String modId) {
+        String label = path.getFileName() != null ? path.getFileName().toString() : path.toString();
         try (Reader reader = Files.newBufferedReader(path)) {
             JsonObject root = GSON.fromJson(reader, JsonObject.class);
-            if (root == null) return;
-
-            for (String field : root.keySet()) {
-                if (!"sources".equals(field)) {
-                    String msg = "Index file '" + path.getFileName() + "' for mod '" + modId
-                            + "' contains unsupported field '" + field
-                            + "'; an index file may only contain 'sources'";
-                    LOGGER.error(msg);
-                    addLoadingError(modId, new IllegalStateException(msg));
-                }
-            }
-
-            JsonElement sourcesElement = root.get("sources");
-            if (sourcesElement == null || !sourcesElement.isJsonArray()) {
-                String msg = "Index file '" + path.getFileName() + "' for mod '" + modId
-                        + "' must contain a 'sources' array";
-                LOGGER.error(msg);
-                addLoadingError(modId, new IllegalStateException(msg));
-                return;
-            }
-
-            for (JsonElement element : sourcesElement.getAsJsonArray()) {
-                if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
-                    String msg = "Index file '" + path.getFileName() + "' for mod '" + modId
-                            + "': every 'sources' entry must be a string path";
-                    LOGGER.error(msg);
-                    addLoadingError(modId, new IllegalStateException(msg));
-                    continue;
-                }
-                parseSource(modId, element.getAsString(), parsedSources, parsed);
-            }
+            return parseIndexManifest(modId, label, root);
         } catch (Exception e) {
             LOGGER.error("Error parsing JSON file: {}", path, e);
             addLoadingError(modId, new IOException("Error parsing JSON file: " + path, e));
+            return IndexManifest.empty();
+        }
+    }
+
+    /**
+     * Parses one in-memory index manifest. A manifest is a pure declaration: it lists content files
+     * per domain through the top-level arrays {@code on_register} and {@code on_reload}, each entry a
+     * content-file path relative to {@code data/<mod>/} and including the {@code .json} suffix. The
+     * manifest does not name any registration type.
+     *
+     * <p>Both fields are independently optional but at least one must be present: a manifest that
+     * declares neither (including an empty file or one made only of unknown fields) is reported and
+     * contributes no paths (D1). An empty array is valid and still counts as declared (D2). Malformed
+     * input never aborts the file: an unknown top-level field and a field that is not an array are
+     * each reported, and the sibling field is still read (D3). {@code sources} is not an alias — it
+     * goes through the ordinary unknown-field path (D5).
+     *
+     * <p>This is the in-memory half of the index pipeline with no NeoForge dependency, exposed so the
+     * schema rules can be asserted by a plain JVM test (in the same spirit as
+     * {@link #parseContentBody(String, String, JsonObject)}).
+     *
+     * @param modId the owning mod's id, used to bucket diagnostics
+     * @param label human-readable name of the manifest, used in diagnostics
+     * @param root  the manifest document, or {@code null} for an empty file
+     * @return what the manifest declared, never {@code null}
+     */
+    public static IndexManifest parseIndexManifest(String modId, String label, JsonObject root) {
+        JsonObject document = root == null ? new JsonObject() : root;
+
+        for (String field : document.keySet()) {
+            if (ON_REGISTER.equals(field) || ON_RELOAD.equals(field)) continue;
+            String msg = "Index file '" + label + "' for mod '" + modId
+                    + "' contains unsupported field '" + field
+                    + "'; an index file may only contain 'on_register' and 'on_reload'";
+            LOGGER.error(msg);
+            addLoadingError(modId, new IllegalStateException(msg));
+        }
+
+        List<String> onRegisterPaths = readPathArray(modId, label, document, ON_REGISTER);
+        List<String> onReloadPaths = readPathArray(modId, label, document, ON_RELOAD);
+
+        boolean declaredOnRegister = document.has(ON_REGISTER) && document.get(ON_REGISTER).isJsonArray();
+        boolean declaredOnReload = document.has(ON_RELOAD) && document.get(ON_RELOAD).isJsonArray();
+
+        if (!declaredOnRegister && !declaredOnReload) {
+            String msg = "Index file '" + label + "' for mod '" + modId
+                    + "' declares neither 'on_register' nor 'on_reload'; an index file must declare "
+                    + "at least one of them";
+            LOGGER.error(msg);
+            addLoadingError(modId, new IllegalStateException(msg));
+        }
+
+        return new IndexManifest(declaredOnRegister, declaredOnReload,
+                List.copyOf(onRegisterPaths), List.copyOf(onReloadPaths));
+    }
+
+    /**
+     * Reads one of the two path arrays of a manifest. A field that is present but not an array, or an
+     * entry that is not a string, is reported without aborting the sibling field (D3).
+     */
+    private static List<String> readPathArray(String modId, String label, JsonObject document, String field) {
+        if (!document.has(field)) return List.of();
+        JsonElement element = document.get(field);
+        if (!element.isJsonArray()) {
+            String msg = "Index file '" + label + "' for mod '" + modId
+                    + "': field '" + field + "' must be an array of content-file paths";
+            LOGGER.error(msg);
+            addLoadingError(modId, new IllegalStateException(msg));
+            return List.of();
+        }
+        List<String> paths = new ArrayList<>();
+        for (JsonElement entry : element.getAsJsonArray()) {
+            if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString()) {
+                String msg = "Index file '" + label + "' for mod '" + modId
+                        + "': every '" + field + "' entry must be a string path";
+                LOGGER.error(msg);
+                addLoadingError(modId, new IllegalStateException(msg));
+                continue;
+            }
+            paths.add(entry.getAsString());
+        }
+        return paths;
+    }
+
+    /**
+     * Aggregates every index manifest read for one mod before anything is consumed (SDD D4/D6), with
+     * no NeoForge dependency so the rules can be asserted by a plain JVM test.
+     *
+     * <p>A path listed in both domains — in the same manifest or across manifests — is rejected
+     * fail-closed: one diagnostic per path is recorded and the path is dropped from both lists, so
+     * neither domain consumes it. When no manifest declared either field, the aggregate
+     * "declares neither" diagnostic is recorded and the caller must register nothing; a mod that only
+     * declared {@code on_reload} is a valid pure reload mod and gets no aggregate error.
+     *
+     * @param modId     the owning mod's id, used to bucket diagnostics
+     * @param manifests every manifest read for the mod, in load order
+     * @return the paths each domain may consume, plus what the mod declared
+     */
+    public static ResolvedIndex resolveIndexManifests(String modId, List<IndexManifest> manifests) {
+        boolean declaredOnRegister = false;
+        boolean declaredOnReload = false;
+        List<String> onRegisterPaths = new ArrayList<>();
+        List<String> onReloadPaths = new ArrayList<>();
+        for (IndexManifest manifest : manifests) {
+            declaredOnRegister |= manifest.declaredOnRegister();
+            declaredOnReload |= manifest.declaredOnReload();
+            onRegisterPaths.addAll(manifest.onRegisterPaths());
+            onReloadPaths.addAll(manifest.onReloadPaths());
+        }
+
+        Set<String> reloadPaths = new HashSet<>(onReloadPaths);
+        Set<String> crossListed = new LinkedHashSet<>();
+        for (String path : onRegisterPaths) {
+            if (reloadPaths.contains(path)) crossListed.add(path);
+        }
+        if (!crossListed.isEmpty()) {
+            for (String path : crossListed) {
+                String msg = "Index path '" + path + "' for mod '" + modId
+                        + "' is listed in both 'on_register' and 'on_reload'; a content file belongs to "
+                        + "exactly one domain and is therefore consumed by neither";
+                LOGGER.error(msg);
+                addLoadingError(modId, new IllegalStateException(msg));
+            }
+            onRegisterPaths.removeIf(crossListed::contains);
+            onReloadPaths.removeIf(crossListed::contains);
+        }
+
+        if (!declaredOnRegister && !declaredOnReload) {
+            String msg = "Data-driven index for mod '" + modId + "' declares neither 'on_register' nor "
+                    + "'on_reload' in any index file; no entries can be loaded";
+            LOGGER.warn(msg);
+            addLoadingError(modId, new IllegalStateException(msg));
+        }
+
+        return new ResolvedIndex(declaredOnRegister, declaredOnReload,
+                List.copyOf(onRegisterPaths), List.copyOf(onReloadPaths));
+    }
+
+    /**
+     * What one index manifest declared, in the order the file wrote it. Produced by
+     * {@link #parseIndexManifest(String, String, JsonObject)} without consuming anything.
+     *
+     * @param declaredOnRegister whether {@code on_register} was present as an array (an empty array
+     *                           still counts — D2)
+     * @param declaredOnReload   whether {@code on_reload} was present as an array
+     * @param onRegisterPaths    the {@code on_register} entries, in file order
+     * @param onReloadPaths      the {@code on_reload} entries, in file order
+     */
+    public record IndexManifest(boolean declaredOnRegister, boolean declaredOnReload,
+                                List<String> onRegisterPaths, List<String> onReloadPaths) {
+        /** A manifest that declared nothing; used when an index file cannot be read at all. */
+        static IndexManifest empty() {
+            return new IndexManifest(false, false, List.of(), List.of());
+        }
+    }
+
+    /**
+     * The aggregate of every index manifest of one mod, after cross-domain conflicts were removed
+     * (D6). {@link #nothingDeclared()} is the D4 predicate: when true no index file declared either
+     * domain, no entries can be loaded, and the caller must return without registering anything.
+     *
+     * @param declaredOnRegister whether any manifest declared {@code on_register}
+     * @param declaredOnReload   whether any manifest declared {@code on_reload}
+     * @param onRegisterPaths    the {@code on_register} entries to consume, conflicts removed
+     * @param onReloadPaths      the {@code on_reload} entries, conflicts removed
+     */
+    public record ResolvedIndex(boolean declaredOnRegister, boolean declaredOnReload,
+                                List<String> onRegisterPaths, List<String> onReloadPaths) {
+        /** True when no index file declared either domain (D4). */
+        public boolean nothingDeclared() {
+            return !declaredOnRegister && !declaredOnReload;
         }
     }
 
@@ -417,7 +573,7 @@ public class JsonTreeBuilder {
      * loading error, and returns only the winning definitions grouped by their handler.
      *
      * <p>The candidate order is the loader's load order (index files sorted by path, then each
-     * manifest's {@code sources} array, then each type field's array); last-wins therefore means "the
+     * manifest's {@code on_register} array, then each type field's array); last-wins therefore means "the
      * last source entry parsed". Failures while resolving an identity downgrade the entry to "no
      * identity" instead of escaping, keeping the no-crash guarantee.
      */

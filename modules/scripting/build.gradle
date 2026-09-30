@@ -19,6 +19,13 @@ sourceSets {}
 useModProject(project(':modules:core'))
 useModProject(project(':modules:modelling'))
 
+// This module mirrors modelling's classes into its own mod layer, and modelling's reload
+// orchestrator links data-driven's index reader at class level. data-driven must therefore be in
+// the mod layer here too -- it arrives on the classpath through modelling's `implementation`
+// dependency, so registering its source set is enough. Without it the ephemeral JUnit server fails
+// with NoClassDefFoundError: lib/kasuga/registration/data_driven/builder/JsonTreeBuilder.
+evaluationDependsOn(':modules:data-driven')
+
 
 configurations {}
 
@@ -91,6 +98,9 @@ neoForge {
             // Inlcude the core subproject as a dependency.
             sourceSet(sourceSets.main)
             sourceSet(sourceSets.test)
+            // Mirror of the data-driven module, which modelling's reload orchestrator needs at
+            // runtime (see evaluationDependsOn above).
+            sourceSet(project(':modules:data-driven').sourceSets.main)
         }
     }
 

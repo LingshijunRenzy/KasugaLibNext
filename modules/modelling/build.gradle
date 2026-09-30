@@ -25,6 +25,13 @@ repositories {
 
 useModProject(project(":modules:core"))
 
+// The reload orchestrator (ReloadIndexLoader) reuses the data-driven index reader
+// (JsonTreeBuilder.indexDirectorySegments / parseIndexManifest / resolveIndexManifests), so
+// modelling now depends on data-driven. Cross-project sourceSet access below (the mods{} mirror)
+// needs the dependency project evaluated first; without evaluationDependsOn the lookup silently
+// resolves to the root project's source sets.
+evaluationDependsOn(':modules:data-driven')
+
 
 configurations {
     shadowLibrary
@@ -211,6 +218,12 @@ neoForge {
             sourceSet(sourceSets.main)
             sourceSet(sourceSets.contentTesting)
             sourceSet(sourceSets.gameTest)
+            // Mirror: data-driven sits on this module's classpath (see dependencies) and must
+            // therefore also be part of the mod layer. Otherwise its @Context bean
+            // (JsonTreeIntegration) is loaded by the plain classpath loader while the core types it
+            // injects come from the mod (union) layer, and Micronaut fails to resolve the bean —
+            // the class-identity split recorded in the data-driven build script.
+            sourceSet(project(':modules:data-driven').sourceSets.main)
         }
     }
 
@@ -241,6 +254,13 @@ dependencies {
     }
 
     implementation project(":modules:inject")
+
+    // Reuses the data-driven index reader from the reload side (ReloadIndexLoader). data-driven's
+    // main source set only depends on core + inject, so modelling -> data-driven is a one-way edge
+    // with no cycle. It is a real runtime dependency (ReloadIndexLoader links JsonTreeBuilder at
+    // class level), so every module that mirrors modelling into its own mod layer must mirror
+    // data-driven as well -- scripting does, next to its useModProject(modelling) call.
+    implementation project(":modules:data-driven")
 
     implementation project(":modules:formula")
     additionalRuntimeClasspath project(":modules:formula")

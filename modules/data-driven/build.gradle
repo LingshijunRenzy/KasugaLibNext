@@ -136,11 +136,6 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter:5.7.1'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     testImplementation "net.neoforged:testframework:${project.neo_version}"
-
-    // FSM 冒烟测试（fsm_block/fsm_be 工厂与 AnimationBlockEntity）需要 modelling；
-    // 仅测试源集依赖，无循环（data-driven main 不依赖 modelling）。
-    contentTestingImplementation project(":modules:modelling")
-    testImplementation project(":modules:modelling")
 }
 
 tasks.withType(JavaCompile).configureEach {

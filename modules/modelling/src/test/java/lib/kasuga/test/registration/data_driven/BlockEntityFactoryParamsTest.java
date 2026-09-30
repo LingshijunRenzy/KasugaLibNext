@@ -4,9 +4,9 @@ import com.google.gson.JsonObject;
 import lib.kasuga.registration.Reg;
 import lib.kasuga.registration.factory.FactoryRegistry;
 import lib.kasuga.registration.minecraft.block_entity.BlockEntityReg;
+import lib.kasuga.rendering.models.mc.dynamic.fsm.FsmBlockEntityFactories;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import test.kasuga.data_driven.DataDrivenTestFactories;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,8 +24,10 @@ class BlockEntityFactoryParamsTest {
 
     @BeforeAll
     static void loadFactories() {
-        // 触发 static 块（简单、幂等；测试环境不跑 Micronaut bean 生命周期）
-        assertNotNull(DataDrivenTestFactories.class);
+        // Register the FSM built-ins directly (idempotent). DataDrivenTestFactories' static registration
+        // block only fires when Micronaut instantiates that @Context bean (FML runtime); in a pure-JVM gate
+        // that never happens, so register here.
+        FsmBlockEntityFactories.registerBuiltin();
         assertNotNull(FactoryRegistry.getBlockEntityFactory("fsm_be"), "fsm_be factory must be registered");
         assertNotNull(FactoryRegistry.get("fsm_block"), "fsm_block factory must be registered");
     }

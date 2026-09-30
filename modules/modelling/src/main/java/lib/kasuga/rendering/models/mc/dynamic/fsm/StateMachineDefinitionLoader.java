@@ -1,45 +1,25 @@
 package lib.kasuga.rendering.models.mc.dynamic.fsm;
 
-import lib.kasuga.rendering.models.uml.dynamic.fsm.*;
-import lib.kasuga.rendering.models.uml.dynamic.fsm.state.*;
-import lib.kasuga.rendering.models.uml.dynamic.fsm.sync.*;
-import lib.kasuga.rendering.models.uml.dynamic.fsm.codec.*;
-import lib.kasuga.rendering.models.uml.dynamic.fsm.function.*;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
-import com.mojang.logging.LogUtils;
 import com.mojang.serialization.JsonOps;
-import io.micronaut.context.annotation.Context;
-import jakarta.annotation.PostConstruct;
-import jakarta.inject.Inject;
-import lib.kasuga.core.resource.ResourceSystem;
-import lib.kasuga.core.resource.ScopedResourceManager;
-import lib.kasuga.core.resource.ScopedResourceManagerConsumer;
-import lib.kasuga.core.resource.ScopedResourcePackListener;
 import lib.kasuga.rendering.models.uml.dynamic.fsm.codec.StateMachineDefinition;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceManager;
-import org.slf4j.Logger;
 
-import javax.annotation.Nullable;
-import java.io.BufferedReader;
-import java.io.IOException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.TreeMap;
 
 /**
- * Loads data-driven state machine definitions from {@code state_machines/*.json} in resource packs
- * and registers them with the injected {@link FsmDefinitions} (defaults to the shared bucket on
- * {@link FsmRegistries#GLOBAL}). Reloaded automatically when the scoped resource manager reloads.
+ * Decodes data-driven state machine files and lists them on the pack stack. It is no longer a reload
+ * participant: {@link ReloadIndexLoader} is the single reload orchestrator and owns the clear / read /
+ * register cycle, so this class deliberately holds no listener, no clear and no bucket. It keeps the
+ * two things the orchestrator needs per file — the canonical directory name ({@value #PATH}) with its
+ * directory-glob discovery, and the strict file-level wrapper decode.
  *
  * <p>File shape: every file is a wrapper object whose only top-level key is
  * {@value #FIELD_STATE_MACHINES}, mapping to an array of definitions —
@@ -47,23 +27,15 @@ import java.util.Set;
  * {@link StateMachineDefinition#CODEC}, which is unchanged; the wrapper exists only at the file
  * layer, so inline/script registration, content hashing and programmatic registration are never
  * affected. One file may hold several definitions, and within a file a later entry with the same id
- * wins (last-wins), mirroring the cross-file contract.
+ * wins (last-wins) — the last-wins resolution itself happens in the orchestrator, together with the
+ * cross-entry order, so it is applied uniformly to both reload entries.
  *
  * <p>Failure isolation: a shape violation (non-object body, missing/extra top-level key, non-array
  * value) rejects the whole file; a malformed array element only drops that element while its
- * siblings still load. Diagnostics are logged only — they are not recorded in the data-driven error
- * bucket yet (that wiring belongs to the reload-domain diagnostics phase).
- *
- * <p>Reload semantics: {@link #load(ResourceManager)} first clears the RESOURCE bucket
- * ({@link FsmDefinitions#clearResource()}) and re-populates it — already-built RESOURCE
- * machines keep running on the structure they were built from (definition bucket and instances are
- * decoupled by design); server-side machines only pick up new definitions when their block entity
- * is reloaded.
+ * siblings still load. The orchestrator turns the returned diagnostics into paired log + bucket
+ * entries.
  */
-@Context
-public final class StateMachineDefinitionLoader implements ScopedResourceManagerConsumer, ScopedResourcePackListener {
-
-    private static final Logger LOGGER = LogUtils.getLogger();
+public final class StateMachineDefinitionLoader {
 
     /** Directory under {@code data/<ns>/} scanned for state machine files. */
     public static final String PATH = "state_machines";
@@ -84,56 +56,19 @@ public final class StateMachineDefinitionLoader implements ScopedResourceManager
      */
     public record DecodedFile(List<StateMachineDefinition> definitions, List<String> errors) {}
 
-    private final FsmDefinitions definitions;
-
-    @Inject
-    ResourceSystem resourceSystem;
-
-    public StateMachineDefinitionLoader() {
-        this(FsmRegistries.GLOBAL.definitions());
-    }
-
-    /** Testable / host-injectable entry: pass a dedicated definition bucket. */
-    public StateMachineDefinitionLoader(FsmDefinitions definitions) {
-        this.definitions = definitions != null ? definitions : FsmRegistries.GLOBAL.definitions();
-    }
-
-    @PostConstruct
-    public void init() {
-        resourceSystem.registerConsumer(this);
-    }
-
-    @Override
-    public void onResourceManagerAdded(@Nullable MinecraftServer server, ScopedResourceManager resourceManager) {
-        resourceManager.addListener(this);
-    }
-
-    @Override
-    public void onResourceManagerRemoved(@Nullable MinecraftServer server, ScopedResourceManager resourceManager) {
-        // Machine instances are host-owned (never cleared here); the next reload re-populates definitions.
-    }
-
-    @Override
-    public void onReloaded(ScopedResourceManager resourceManager) {
-        load(resourceManager.getResourceManager());
-    }
-
-    public void load(ResourceManager resourceManager) {
-        definitions.clearResource();
-        Map<ResourceLocation, Resource> resources = resourceManager.listResources(PATH, loc -> loc.getPath().endsWith(".json"));
-        for (Map.Entry<ResourceLocation, Resource> entry : resources.entrySet()) {
-            ResourceLocation loc = entry.getKey();
-            try (BufferedReader reader = entry.getValue().openAsReader()) {
-                JsonElement json = JsonParser.parseReader(reader);
-                DecodedFile decoded = decodeFile(json);
-                for (String error : decoded.errors()) {
-                    LOGGER.error("Failed to decode state machine file '{}': {}", loc, error);
-                }
-                registerAll(loc, decoded.definitions());
-            } catch (IOException | JsonParseException e) {
-                LOGGER.error("Failed to read state machine definition {}", loc, e);
-            }
-        }
+    /**
+     * Discovers the {@code state_machines/*.json} files of one namespace through the pack stack's
+     * directory glob, sorted by resource location. Kept next to {@link #PATH} so the canonical
+     * directory and its discovery rule stay together; the reload orchestrator calls it and is
+     * responsible for skipping files that the index already lists.
+     *
+     * @param resourceManager the pack stack to read from
+     * @param namespace       the namespace to list, matched verbatim (no cross-namespace leakage)
+     * @return the discovered files by resource location, sorted; empty when the namespace has none
+     */
+    public static Map<ResourceLocation, Resource> discoverFiles(ResourceManager resourceManager, String namespace) {
+        return new TreeMap<>(resourceManager.listResources(PATH,
+                loc -> loc.getNamespace().equals(namespace) && loc.getPath().endsWith(".json")));
     }
 
     /**
@@ -148,7 +83,7 @@ public final class StateMachineDefinitionLoader implements ScopedResourceManager
      */
     public static DecodedFile decodeFile(JsonElement json) {
         List<String> errors = new ArrayList<>();
-        if (!json.isJsonObject()) {
+        if (json == null || !json.isJsonObject()) {
             errors.add("expected an object of shape " + EXPECTED_SHAPE + ", got " + describe(json));
             return new DecodedFile(List.of(), List.copyOf(errors));
         }
@@ -186,33 +121,6 @@ public final class StateMachineDefinitionLoader implements ScopedResourceManager
         return new DecodedFile(List.copyOf(decoded), List.copyOf(errors));
     }
 
-    /**
-     * Registers the decoded definitions with in-file last-wins: when the same id appears more than once
-     * in one file, only the last occurrence is registered and the superseded ones are reported (never
-     * applied), mirroring the loader's cross-file last-wins contract.
-     *
-     * @param loc     the source file, used in diagnostics
-     * @param decoded the definitions decoded from that file, in file order
-     */
-    private void registerAll(ResourceLocation loc, List<StateMachineDefinition> decoded) {
-        Map<Id, StateMachineDefinition> winners = new LinkedHashMap<>();
-        Set<Id> superseded = new LinkedHashSet<>();
-        for (StateMachineDefinition definition : decoded) {
-            if (winners.put(definition.id(), definition) != null) {
-                superseded.add(definition.id());
-            }
-        }
-        for (Id id : superseded) {
-            LOGGER.warn("Duplicate state machine id '{}' in {}: an earlier entry was superseded by a later one "
-                    + "(last-wins); the earlier entry was not registered", id, loc);
-        }
-        for (StateMachineDefinition definition : winners.values()) {
-            Id id = definition.id();
-            definitions.registerResource(id, definition);
-            LOGGER.info("Loaded state machine definition '{}' from {}", id, loc);
-        }
-    }
-
     /** Human-readable JSON kind for diagnostics. */
     private static String describe(JsonElement json) {
         if (json == null || json.isJsonNull()) {
@@ -229,4 +137,6 @@ public final class StateMachineDefinitionLoader implements ScopedResourceManager
         }
         return json.toString();
     }
+
+    private StateMachineDefinitionLoader() {}
 }

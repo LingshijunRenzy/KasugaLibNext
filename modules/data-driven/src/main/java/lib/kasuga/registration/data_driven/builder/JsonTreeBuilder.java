@@ -477,6 +477,14 @@ public class JsonTreeBuilder {
                         + embedded.getParentTypeName() + "' entry's '" + embedded.getEmbeddedKeyName()
                         + "' key instead of as a top-level field";
             }
+            // Conditional hint (D9): the same "unsupported field" message is what an author sees when
+            // they list a reload-domain content file (e.g. state machine definitions) in on_register.
+            // The registration domain does not recognise reload-domain shapes, so instead of widening
+            // the known set the message points at the index's other array. The key is spelled out
+            // literally on purpose: data-driven must not depend on the modelling module that owns it.
+            msg += ". If these fields belong to reload-domain content (for example state machine "
+                    + "definitions written as a 'state_machines' array), list this file under "
+                    + "'on_reload' instead";
             LOGGER.error(msg);
             addLoadingError(modId, new IllegalStateException(msg));
         }

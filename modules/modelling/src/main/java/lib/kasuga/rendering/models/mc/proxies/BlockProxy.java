@@ -9,6 +9,12 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.Objects;
 
+/**
+ * Block-flavoured {@link ElementProxy} implementation.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class BlockProxy<ProxiedType extends Block, ProxiedInstanceType extends BlockState> implements ElementProxy<ProxiedType, ProxiedInstanceType> {
 
     private final ProxiedType block;

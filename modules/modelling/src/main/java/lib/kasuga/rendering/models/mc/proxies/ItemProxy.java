@@ -7,6 +7,12 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.Objects;
 
+/**
+ * Item-flavoured {@link ElementProxy} implementation.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class ItemProxy<ProxiedType extends Item, ProxiedInstanceType extends ItemStack> implements ElementProxy<ProxiedType, ProxiedInstanceType> {
 
     private final ProxiedType item;

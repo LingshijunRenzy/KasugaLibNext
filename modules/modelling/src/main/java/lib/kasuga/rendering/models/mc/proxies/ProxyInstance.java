@@ -5,6 +5,12 @@ import lombok.Getter;
 import lombok.Setter;
 import org.jetbrains.annotations.Nullable;
 
+/**
+ * A proxy paired with the {@link ModelInstance} currently bound to it.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class ProxyInstance<R, T extends ElementProxy<R, T>> {
 
     private final T proxyType;

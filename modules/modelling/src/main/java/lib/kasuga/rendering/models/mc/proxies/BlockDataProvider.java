@@ -12,6 +12,12 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.HashMap;
 
+/**
+ * Block-state/block-entity {@link DataProvider} produced by {@link BlockProxy}.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class BlockDataProvider implements DataProvider {
 
     protected final HashMap<String, Property<?>> properties;

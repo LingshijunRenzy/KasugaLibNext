@@ -8,17 +8,27 @@
 data/<namespace>/state_machines/<path>.json
 ```
 
-文件解析出的 `id` 字段就是机器的标识(如 `kasuga_lib:beacon`),方块/BE 通过这个 id 绑定机器。文件路径与 id 不需要一致。
+文件里定义的 `id` 就是机器的标识(如 `kasuga_lib:beacon`),方块/BE 通过这个 id 绑定机器。文件路径与 id 不需要一致。
+
+文件发现目前只有**目录通配**一个入口:`StateMachineDefinitionLoader` 在 reload 期读取 `state_machines/` 下所有 `.json`。阶段 2 起会新增第二个入口——`data/<ns>/kasuga_lib/data_driven/` 索引的 reload 段(`on_reload`,拆分前的旧字段名是 `sources`;见 SDD §4.4/§5.1)列出同一批文件。两个入口并存,目录通配保留为兜底。索引字段 `on_reload` 本身已随 SDD 2-a 落地,但**读取它的 reload 加载器尚未接线**(波次:阶段 2)。
 
 ## 顶层结构
 
+每个文件是一个包装对象,唯一的顶层键是 `state_machines`,其值是定义数组:
+
 ```json
 {
-  "id": "<namespace>:<path>",     // 必填,机器标识
-  "state_vars": [ ... ],          // 可选,类型化变量声明
-  "layers":  [ ... ]              // 必填,并行状态层
+  "state_machines": [
+    {
+      "id": "<namespace>:<path>",     // 必填,机器标识
+      "state_vars": [ ... ],          // 可选,类型化变量声明
+      "layers":  [ ... ]              // 必填,并行状态层
+    }
+  ]
 }
 ```
+
+一个文件可以放多个定义。**数组顺序即 last-wins 顺序**:同一文件内重复 id 时后者胜,前者不注册。顶层只能有 `state_machines` 这一个键:多键/杂键,或旧形状(顶层直接是一个定义对象),都会**整文件拒绝**;数组里单个元素写坏只跳过该元素,其余照常加载。
 
 ## state_vars(可选)
 
@@ -107,23 +117,27 @@ data/<namespace>/state_machines/<path>.json
 
 ```json
 {
-  "id": "kasuga_lib:fan",
-  "state_vars": [
-    { "name": "powered", "type": "bool", "default": false },
-    { "name": "speed",   "type": "float", "default": 0.0 }
-  ],
-  "layers": [{
-    "id": "body", "mode": "base", "weight": 1.0, "initial_state": "off",
-    "states": [
-      { "id": "off",       "pose": { "morphs": { "spin": 0.0 } } },
-      { "id": "spinning",  "pose": { "morphs": { "spin": 1.0 } },
-        "on_update": ["kasuga_lib:fan_ramp_speed"] }
-    ],
-    "transitions": [
-      { "id": "off_to_spin",  "from": "off",      "to": "spinning", "when": ["kasuga_lib:is_powered"], "cross_fade_seconds": 0.25 },
-      { "id": "spin_to_off",  "from": "spinning", "to": "off",      "when": ["kasuga_lib:is_unpowered"], "cross_fade_seconds": 0.5 }
-    ]
-  }]
+  "state_machines": [
+    {
+      "id": "kasuga_lib:fan",
+      "state_vars": [
+        { "name": "powered", "type": "bool", "default": false },
+        { "name": "speed",   "type": "float", "default": 0.0 }
+      ],
+      "layers": [{
+        "id": "body", "mode": "base", "weight": 1.0, "initial_state": "off",
+        "states": [
+          { "id": "off",       "pose": { "morphs": { "spin": 0.0 } } },
+          { "id": "spinning",  "pose": { "morphs": { "spin": 1.0 } },
+            "on_update": ["kasuga_lib:fan_ramp_speed"] }
+        ],
+        "transitions": [
+          { "id": "off_to_spin",  "from": "off",      "to": "spinning", "when": ["kasuga_lib:is_powered"], "cross_fade_seconds": 0.25 },
+          { "id": "spin_to_off",  "from": "spinning", "to": "off",      "when": ["kasuga_lib:is_unpowered"], "cross_fade_seconds": 0.5 }
+        ]
+      }]
+    }
+  ]
 }
 ```
 
@@ -133,7 +147,7 @@ data/<namespace>/state_machines/<path>.json
 
 ## 绑定到方块
 
-数据驱动注册的方块通过 `fsm_block` + `fsm_be` 工厂绑定一个机器 id,详见 `doc/data-driven-registration.md`:
+数据驱动注册的方块通过 `fsm_block` + `fsm_be` 工厂绑定一个机器 id,详见 `doc/data-driven/guide-content.md`:
 ```json
 { "id": "kasuga_lib:fan_block", "type": "fsm_block", "state_machine": "kasuga_lib:fan",
   "block_entity": { "type": "fsm_be", "params": { "model": "kasuga_lib:models/fan.obj" } } }

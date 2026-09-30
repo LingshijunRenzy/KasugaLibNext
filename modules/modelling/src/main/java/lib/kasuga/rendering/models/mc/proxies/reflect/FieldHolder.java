@@ -7,6 +7,13 @@ import org.jetbrains.annotations.Nullable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 
+/**
+ * Reflection handle for one field discovered by {@link InstanceProbe}.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link lib.kasuga.rendering.models.mc.proxies.ElementProxy}:
+ * the whole {@code mc.proxies} family, this {@code reflect} helper included, has no construction
+ * site and no reference outside the package. Retained pending a design pass.
+ */
 public class FieldHolder {
 
     @Getter

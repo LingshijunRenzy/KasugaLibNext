@@ -10,6 +10,12 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.HashMap;
 
+/**
+ * Item-stack {@link DataProvider} mirroring {@link ItemProxy}'s data.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class ItemDataProvider implements DataProvider {
 
     protected final ItemStack stack;

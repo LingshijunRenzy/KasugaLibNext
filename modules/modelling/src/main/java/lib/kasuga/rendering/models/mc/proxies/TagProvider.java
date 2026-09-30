@@ -6,6 +6,12 @@ import net.minecraft.tags.TagKey;
 import java.util.Set;
 import java.util.stream.Stream;
 
+/**
+ * Membership test over an element's tags, for the element-proxy layer.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link ElementProxy}: no construction site and no reference
+ * outside the {@code mc.proxies} package. Retained pending a design pass.
+ */
 public class TagProvider {
 
     protected final Set<String> tags;

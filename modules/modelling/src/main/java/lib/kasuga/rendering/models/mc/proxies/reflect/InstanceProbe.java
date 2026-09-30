@@ -7,6 +7,13 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * Reflectively enumerates an instance's fields into {@link FieldHolder}s.
+ *
+ * <p><b>Unwired scaffolding</b> — see {@link lib.kasuga.rendering.models.mc.proxies.ElementProxy}:
+ * the whole {@code mc.proxies} family, this {@code reflect} helper included, has no construction
+ * site and no reference outside the package. Retained pending a design pass.
+ */
 public class InstanceProbe<TargetType> {
 
     @Getter

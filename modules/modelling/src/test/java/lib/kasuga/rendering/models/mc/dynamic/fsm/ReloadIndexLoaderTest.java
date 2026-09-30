@@ -6,27 +6,12 @@ import lib.kasuga.rendering.models.uml.dynamic.fsm.FsmAnimationClips;
 import lib.kasuga.rendering.models.uml.dynamic.fsm.FsmDefinitions;
 import lib.kasuga.rendering.models.uml.dynamic.fsm.Id;
 import lib.kasuga.rendering.models.uml.dynamic.fsm.codec.StateMachineDefinition;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.packs.PackResources;
-import net.minecraft.server.packs.resources.Resource;
-import net.minecraft.server.packs.resources.ResourceManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.io.ByteArrayInputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.TreeMap;
-import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -36,19 +21,19 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Covers the reload orchestrator against a stub {@link ResourceManager}: one clear per cycle, the two
- * discovery entries (directory glob and the index's {@code on_reload} array), the interaction between
- * them, cross-entry last-wins, and the paired diagnostics.
+ * Covers the reload orchestrator against a stub {@link net.minecraft.server.packs.resources.ResourceManager}
+ * ({@link StubResourceManager}): one clear per cycle, the two discovery entries (directory glob and the
+ * index's {@code on_reload} array), the interaction between them, cross-entry last-wins, and the paired
+ * diagnostics.
  *
  * <p>This is a plain JVM test — no mod jar and no running game; the pack stack is a plain map of
  * virtual files. The wrapper/decode contract itself is locked down in
- * {@code StateMachineDefinitionLoaderTest}.
+ * {@code StateMachineDefinitionLoaderTest}, and the clip half of the domain (decode, registration and
+ * the post-load reference check) in {@code AnimationClipLoaderTest} / {@code AnimationClipReloadTest}.
  */
 class ReloadIndexLoaderTest {
 
     private static final String NS = "reload_test";
-
-    private static final ResourceLocation GOOD_ID = ResourceLocation.fromNamespaceAndPath(NS, "good");
 
     private static final String GOOD_JSON = """
             {
@@ -111,8 +96,8 @@ class ReloadIndexLoaderTest {
         return new ReloadIndexLoader(definitions, new FsmAnimationClips());
     }
 
-    private static TestResourceManager manager(String path, String content) {
-        return new TestResourceManager().add(NS, path, content);
+    private static StubResourceManager manager(String path, String content) {
+        return new StubResourceManager().add(NS, path, content);
     }
 
     private static String indexManifest(String onReloadEntry) {
@@ -131,7 +116,7 @@ class ReloadIndexLoaderTest {
 
     @Test
     void brokenJsonDoesNotAbortTheBatch() {
-        orchestrator().reload(new TestResourceManager()
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "state_machines/broken.json", BROKEN_JSON)
                 .add(NS, "state_machines/good.json", GOOD_JSON));
 
@@ -150,7 +135,7 @@ class ReloadIndexLoaderTest {
         definitions.register(scriptId, definitions.get(Id.fromNamespaceAndPath(NS, "good")));
 
         // second cycle with an empty pack: RESOURCE definitions go away, SCRIPT stays
-        orchestrator.reload(new TestResourceManager());
+        orchestrator.reload(new StubResourceManager());
         assertNull(definitions.get(Id.fromNamespaceAndPath(NS, "good")));
         assertNotNull(definitions.get(scriptId));
     }
@@ -175,7 +160,7 @@ class ReloadIndexLoaderTest {
     @Test
     void sameJsonCanBeLoadedTwiceWithoutError() {
         ReloadIndexLoader orchestrator = orchestrator();
-        TestResourceManager pack = manager("state_machines/good.json", GOOD_JSON);
+        StubResourceManager pack = manager("state_machines/good.json", GOOD_JSON);
         orchestrator.reload(pack);
         orchestrator.reload(pack);
         assertNotNull(definitions.get(Id.fromNamespaceAndPath(NS, "good")));
@@ -205,7 +190,7 @@ class ReloadIndexLoaderTest {
         AtomicInteger invalidations = new AtomicInteger();
         definitions.addListener(id -> invalidations.incrementAndGet());
 
-        orchestrator().reload(new TestResourceManager()
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "kasuga_lib/data_driven/index.json", indexManifest("state_machines/good.json"))
                 .add(NS, "state_machines/good.json", GOOD_JSON));
 
@@ -225,7 +210,7 @@ class ReloadIndexLoaderTest {
         AtomicInteger invalidations = new AtomicInteger();
         definitions.addListener(id -> invalidations.incrementAndGet());
 
-        orchestrator().reload(new TestResourceManager()
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "state_machines/a.json", GLOB_DUPLICATE_JSON)
                 .add(NS, "kasuga_lib/data_driven/index.json", indexManifest("content/b.json"))
                 .add(NS, "content/b.json", INDEX_DUPLICATE_JSON));
@@ -269,7 +254,7 @@ class ReloadIndexLoaderTest {
     /** Registration content listed in on_reload is reported with the symmetric hint toward on_register. */
     @Test
     void registrationContentListedUnderOnReloadIsHintedAtOnRegister() {
-        orchestrator().reload(new TestResourceManager()
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "kasuga_lib/data_driven/index.json", indexManifest("content/blocks.json"))
                 .add(NS, "content/blocks.json", "{ \"blocks\": [] }"));
 
@@ -279,10 +264,13 @@ class ReloadIndexLoaderTest {
                 "the hint must point at the index's other array: " + Diagnostics.errors(NS));
     }
 
-    /** {@code animation_clips} is a recognised reload-domain key; nothing consumes it yet, so it is silent. */
+    /**
+     * {@code animation_clips} is a reload-domain key with a consumer: an empty array loads cleanly (and
+     * the clip half of the domain is covered by {@code AnimationClipReloadTest}).
+     */
     @Test
-    void animationClipsKeyIsRecognisedWithoutAConsumer() {
-        orchestrator().reload(new TestResourceManager()
+    void animationClipsKeyIsRecognisedAndConsumed() {
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "kasuga_lib/data_driven/index.json", indexManifest("content/clips.json"))
                 .add(NS, "content/clips.json", "{ \"animation_clips\": [] }"));
 
@@ -293,7 +281,7 @@ class ReloadIndexLoaderTest {
     /** A manifest path that fails the shared path contract is reported and skipped. */
     @Test
     void invalidIndexPathIsReportedAndSkipped() {
-        orchestrator().reload(new TestResourceManager()
+        orchestrator().reload(new StubResourceManager()
                 .add(NS, "kasuga_lib/data_driven/index.json", indexManifest("../escape.json")));
 
         assertTrue(errorsContain("Invalid 'on_reload' path '../escape.json'"),
@@ -303,63 +291,5 @@ class ReloadIndexLoaderTest {
     private static boolean errorsContain(String needle) {
         return Diagnostics.errors(NS).stream()
                 .anyMatch(error -> error.getMessage() != null && error.getMessage().contains(needle));
-    }
-
-    // --- test double ---
-
-    /** In-memory pack stack: a map of virtual files, keyed by resource location. */
-    private static final class TestResourceManager implements ResourceManager {
-
-        private final Map<ResourceLocation, String> files = new LinkedHashMap<>();
-
-        TestResourceManager add(String namespace, String path, String content) {
-            files.put(ResourceLocation.fromNamespaceAndPath(namespace, path), content);
-            return this;
-        }
-
-        @Override
-        public Set<String> getNamespaces() {
-            return files.keySet().stream().map(ResourceLocation::getNamespace)
-                    .collect(Collectors.toCollection(TreeSet::new));
-        }
-
-        @Override
-        public Optional<Resource> getResource(ResourceLocation location) {
-            String content = files.get(location);
-            return content == null ? Optional.empty() : Optional.of(resource(content));
-        }
-
-        @Override
-        public List<Resource> getResourceStack(ResourceLocation location) {
-            return getResource(location).map(List::of).orElseGet(List::of);
-        }
-
-        @Override
-        public Map<ResourceLocation, Resource> listResources(String path, Predicate<ResourceLocation> filter) {
-            Map<ResourceLocation, Resource> result = new TreeMap<>();
-            files.forEach((loc, content) -> {
-                if (loc.getPath().startsWith(path + "/") && filter.test(loc)) {
-                    result.put(loc, resource(content));
-                }
-            });
-            return result;
-        }
-
-        @Override
-        public Map<ResourceLocation, List<Resource>> listResourceStacks(String path,
-                                                                       Predicate<ResourceLocation> filter) {
-            Map<ResourceLocation, List<Resource>> result = new TreeMap<>();
-            listResources(path, filter).forEach((loc, resource) -> result.put(loc, List.of(resource)));
-            return result;
-        }
-
-        @Override
-        public Stream<PackResources> listPacks() {
-            return Stream.of();
-        }
-
-        private static Resource resource(String content) {
-            return new Resource(null, () -> new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8)));
-        }
     }
 }

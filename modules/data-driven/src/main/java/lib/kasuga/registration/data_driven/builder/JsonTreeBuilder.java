@@ -272,7 +272,7 @@ public class JsonTreeBuilder {
             try (Reader reader = Files.newBufferedReader(contentPath)) {
                 JsonObject content = GSON.fromJson(reader, JsonObject.class);
                 if (content == null) return;
-                dispatchContent(content, modId, contentPath, sourcePath, parsed);
+                dispatchContent(content, modId, contentPath.toString(), sourcePath, parsed);
             }
         } catch (Exception e) {
             LOGGER.error("Error parsing source '{}' for mod '{}': {}", sourcePath, modId, e.getMessage());
@@ -286,35 +286,53 @@ public class JsonTreeBuilder {
      * definition in that array. Embedded types (e.g. a {@code block_entity} inside a block definition)
      * are extracted from their parent object.
      * <p>
+     * Embedded types only ever arrive through {@link TypeHandler#extractEmbedded(JsonObject)}, so a
+     * top-level field named after one (e.g. {@code block_entities}) is not a dispatch slot: it takes
+     * the same "unsupported top-level field" path as a typo, is reported, and — because an embedded
+     * type has no meaning without its parent — the rest of the file still dispatches normally instead
+     * of the whole file aborting. The message then names the key the author meant to write.
+     * <p>
      * Malformed content is reported instead of skipped silently: an unknown top-level field, a
      * type field that is not an array, and a non-object array entry each produce an error log and a
      * per-mod loading error, matching the strictness already applied to index files.
      *
-     * @param contentPath the content file being dispatched, used in diagnostics
-     * @param sourcePath  the content file path relative to {@code data/<mod>/}, stored as the
-     *                    entry's provenance for duplicate diagnostics
+     * @param contentLabel the content file being dispatched, used in diagnostics
+     * @param sourcePath   the content file path relative to {@code data/<mod>/}, stored as the
+     *                     entry's provenance for duplicate diagnostics
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static void dispatchContent(JsonObject root, String modId, Path contentPath,
+    private static void dispatchContent(JsonObject root, String modId, String contentLabel,
                                         String sourcePath, Map parsed) {
         Set<String> knownFields = new LinkedHashSet<>();
+        Map<String, TypeHandler<?>> embeddedByField = new LinkedHashMap<>();
         for (TypeHandler<?> handler : TypeHandlerRegistry.all()) {
-            knownFields.add(handler.getTypeName());
+            if (handler.getParentTypeName() == null) {
+                knownFields.add(handler.getTypeName());
+            } else {
+                embeddedByField.put(handler.getTypeName(), handler);
+            }
         }
         for (String field : root.keySet()) {
             if (knownFields.contains(field)) continue;
-            String msg = "Content file '" + contentPath + "' for mod '" + modId
+            String msg = "Content file '" + contentLabel + "' for mod '" + modId
                     + "' contains unsupported top-level field '" + field
                     + "'; supported fields are " + knownFields;
+            TypeHandler<?> embedded = embeddedByField.get(field);
+            if (embedded != null) {
+                msg += ". '" + field + "' is an embedded type: write it inside a '"
+                        + embedded.getParentTypeName() + "' entry's '" + embedded.getEmbeddedKeyName()
+                        + "' key instead of as a top-level field";
+            }
             LOGGER.error(msg);
             addLoadingError(modId, new IllegalStateException(msg));
         }
 
         for (TypeHandler<?> handler : TypeHandlerRegistry.all()) {
+            if (handler.getParentTypeName() != null) continue; // embedded types are not top-level fields
             if (!root.has(handler.getTypeName())) continue;
             JsonElement field = root.get(handler.getTypeName());
             if (!field.isJsonArray()) {
-                String msg = "Content file '" + contentPath + "' for mod '" + modId
+                String msg = "Content file '" + contentLabel + "' for mod '" + modId
                         + "': field '" + handler.getTypeName() + "' must be an array";
                 LOGGER.error(msg);
                 addLoadingError(modId, new IllegalStateException(msg));
@@ -322,7 +340,7 @@ public class JsonTreeBuilder {
             }
             for (JsonElement el : field.getAsJsonArray()) {
                 if (!el.isJsonObject()) {
-                    String msg = "Content file '" + contentPath + "' for mod '" + modId
+                    String msg = "Content file '" + contentLabel + "' for mod '" + modId
                             + "': every entry in '" + handler.getTypeName() + "' must be a JSON object";
                     LOGGER.error(msg);
                     addLoadingError(modId, new IllegalStateException(msg));
@@ -356,6 +374,37 @@ public class JsonTreeBuilder {
         Object def = handler.parse(json);
         List list = (List) parsed.computeIfAbsent(handler, k -> new ArrayList());
         list.add(new ParsedEntry(handler, def, sourcePath));
+    }
+
+    /**
+     * Dispatches one content document that is already in memory and returns the definitions that were
+     * collected, grouped by handler type name in dispatch order. This is the half of the content
+     * pipeline that has no NeoForge dependency — {@link #parseSource} resolves and reads the file
+     * first, then hands the body here — which makes the dispatch rules (unknown top-level fields,
+     * embedded types, half-apply behaviour) assertable by a plain JVM test.
+     *
+     * <p>Malformed input is reported through the mod's loading-error bucket, never thrown: callers
+     * get back whatever was still parseable. Nothing is registered — this only parses and collects.
+     *
+     * @param modId      the owning mod's id, used to bucket diagnostics
+     * @param contentLabel human-readable name of the document, used in diagnostics
+     * @param root       the content document
+     * @return the collected definitions per handler type name; empty when nothing parsed
+     */
+    public static Map<String, List<Object>> parseContentBody(String modId, String contentLabel, JsonObject root) {
+        ensureHandlersRegistered();
+        Map<TypeHandler<?>, List<ParsedEntry>> parsed = new LinkedHashMap<>();
+        dispatchContent(root, modId, contentLabel, contentLabel, parsed);
+
+        Map<String, List<Object>> byType = new LinkedHashMap<>();
+        for (Map.Entry<TypeHandler<?>, List<ParsedEntry>> entry : parsed.entrySet()) {
+            List<Object> definitions = new ArrayList<>(entry.getValue().size());
+            for (ParsedEntry parsedEntry : entry.getValue()) {
+                definitions.add(parsedEntry.definition());
+            }
+            byType.put(entry.getKey().getTypeName(), List.copyOf(definitions));
+        }
+        return Collections.unmodifiableMap(byType);
     }
 
     /**

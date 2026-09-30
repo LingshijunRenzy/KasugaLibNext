@@ -80,12 +80,8 @@ public class JsonTreeBuilder {
         // Every content file is parsed at most once, even if referenced from several manifests.
         Map<TypeHandler<?>, List<ParsedEntry>> parsed = new LinkedHashMap<>();
         Set<String> parsedSources = new HashSet<>();
-        try (Stream<Path> files = Files.list(indexDir)) {
-            files.filter(p -> p.toString().endsWith(".json"))
-                 .sorted()
-                 .forEach(path -> parseIndexFile(path, modId, parsedSources, parsed));
-        } catch (IOException e) {
-            LOGGER.error("Error scanning directory: {}", indexDir, e);
+        for (Path path : listIndexFiles(indexDir, modId)) {
+            parseIndexFile(path, modId, parsedSources, parsed);
         }
 
         if (parsed.isEmpty()) {
@@ -122,13 +118,13 @@ public class JsonTreeBuilder {
                     groupDefs.add((RegistryGroupDef) def);
                 }
                 for (RegistryGroupDef def : topoSortGroupDefs(groupDefs)) {
-                    applyUnchecked(handler, def, context);
+                    applyUnchecked(handler, def, context, modId);
                 }
                 continue;
             }
 
             for (Object def : defs) {
-                applyUnchecked(handler, def, context);
+                applyUnchecked(handler, def, context, modId);
             }
         }
 
@@ -156,7 +152,9 @@ public class JsonTreeBuilder {
                         result.put(modId, root);
                     }
                 } catch (Exception e) {
-                    LOGGER.error("Failed to load JSON registrations for mod '{}'", modId, e);
+                    String msg = "Failed to load JSON registrations for mod '" + modId + "': " + e;
+                    LOGGER.error(msg, e);
+                    addLoadingError(modId, new IllegalStateException(msg, e));
                 }
             }
         }
@@ -472,12 +470,25 @@ public class JsonTreeBuilder {
         }
     }
 
+    /**
+     * Applies one handler and turns any failure into a recorded diagnostic. Registration failures
+     * must leave a trace: a handler that throws has done none of its side effects, so swallowing the
+     * exception would make a failed registration look like a successful one.
+     *
+     * <p>Called by {@link #buildForMod(String)} for every surviving definition; exposed because the
+     * "failed apply is recorded" contract is otherwise only reachable through a full mod-jar load.
+     *
+     * @param modId the owning mod's id, used to bucket the diagnostic
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static void applyUnchecked(TypeHandler handler, Object def, BuildContext context) {
+    public static void applyUnchecked(TypeHandler handler, Object definition, BuildContext context, String modId) {
         try {
-            handler.apply(def, context);
+            handler.apply(definition, context);
         } catch (Exception e) {
-            LOGGER.error("Failed to apply {} handler: {}", handler.getTypeName(), e.getMessage());
+            String msg = "Failed to apply '" + handler.getTypeName() + "' handler for mod '" + modId
+                    + "': " + e;
+            LOGGER.error(msg, e);
+            addLoadingError(modId, new IllegalStateException(msg, e));
         }
     }
 
@@ -505,6 +516,33 @@ public class JsonTreeBuilder {
      */
     public static String[] indexDirectorySegments(String modId) {
         return new String[]{"data", modId, "kasuga_lib", "data_driven"};
+    }
+
+    /**
+     * Lists the JSON index manifests of {@code indexDir}, sorted, recording a diagnostic instead of
+     * throwing when the directory cannot be listed. An empty result is a valid outcome — it means
+     * "no manifest here", and {@link #buildForMod(String)} reports that separately when the directory
+     * exists but yielded no entries.
+     *
+     * <p>Exposed like {@link #indexDirectorySegments(String)} so the failure branch is assertable by a
+     * plain JVM test.
+     *
+     * @param indexDir the index directory to scan
+     * @param modId    the owning mod's id, used to bucket the diagnostic
+     * @return the manifest paths, or an empty list when the directory cannot be listed
+     */
+    public static List<Path> listIndexFiles(Path indexDir, String modId) {
+        try (Stream<Path> files = Files.list(indexDir)) {
+            return files.filter(p -> p.toString().endsWith(".json"))
+                        .sorted()
+                        .toList();
+        } catch (IOException e) {
+            String msg = "Error scanning data-driven index directory for mod '" + modId + "': "
+                    + indexDir + " (" + e + ")";
+            LOGGER.error(msg, e);
+            addLoadingError(modId, new IOException(msg, e));
+            return List.of();
+        }
     }
 
     private static Path findIndexDir(String modId) {

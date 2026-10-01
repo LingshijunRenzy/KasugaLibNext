@@ -8,6 +8,7 @@ import com.mojang.logging.LogUtils;
 import io.micronaut.context.annotation.Context;
 import jakarta.annotation.PostConstruct;
 import jakarta.inject.Inject;
+import lib.kasuga.KasugaLib;
 import lib.kasuga.core.resource.ResourceSystem;
 import lib.kasuga.core.resource.ScopedResourceManager;
 import lib.kasuga.core.resource.ScopedResourceManagerConsumer;
@@ -95,6 +96,16 @@ import java.util.TreeMap;
  * clip. The check must run after the clips are loaded, or every reference would look dangling. It
  * never blocks a registration or changes the build-time degradation: an unresolved clip still falls
  * back to the state's static pose.
+ *
+ * <p><strong>No failure escapes a cycle.</strong> This method sits on the reload listener path, so a
+ * throw would abort the pack reload; and because the cycle clears both buckets before it repopulates
+ * them, a throw would leave the half-cleared (empty) buckets behind. Every stage therefore guards its
+ * own participants and turns a failure into the paired "log + {@link Diagnostics} bucket" diagnostic:
+ * per file (read / decode), per namespace (discovery), per entry (registration) and per definition
+ * (the post-load check). Only a failure that no participant could be charged for reaches the
+ * last-resort guard in {@link #reload(ResourceManager)}. A cycle whose every entry failed leaves the
+ * buckets empty on purpose: the empty state is the truthful outcome and the bucket holds the errors,
+ * whereas restoring the previous entries would hide that this cycle loaded nothing.
  */
 @Context
 public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, ScopedResourcePackListener {
@@ -154,9 +165,28 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
     /**
      * Runs one complete reload cycle against a resource manager.
      *
+     * <p>The whole cycle is bounded by a last-resort guard: this method is a reload listener, and the
+     * buckets were already cleared by the time a stage runs, so a failure must never escape it. Every
+     * stage it calls guards its own participants (see the class documentation); whatever still reaches
+     * this guard has no participant to be charged for, so it is attributed to the library mod that
+     * owns the orchestrator — the same fallback attribution the rest of the module uses for a
+     * diagnostic it cannot tie to a source file.
+     *
      * @param resourceManager the pack stack to read from; must not be {@code null}
      */
     public void reload(ResourceManager resourceManager) {
+        try {
+            runCycle(resourceManager);
+        } catch (RuntimeException e) {
+            reportError(KasugaLib.MODID, "Reload cycle failed before it completed", e);
+        }
+    }
+
+    /**
+     * One clear / discover / register / re-check cycle. Kept apart from {@link #reload(ResourceManager)}
+     * so the public entry stays a single guard around it.
+     */
+    private void runCycle(ResourceManager resourceManager) {
         // Exactly one clear per cycle (the orchestrator owns it): both entries below then populate
         // the same buckets, so neither can erase the other's writes. The clip clear drops only
         // reload-sourced clips -- clips registered by scripts / code keep their entry ("script wins").
@@ -173,11 +203,7 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
         // their list is already in load order: glob-discovered ones first, then the on_reload ones.
         List<DuplicateIdResolver.Candidate> clipCandidates = new ArrayList<>();
         for (String namespace : namespaces) {
-            // The index is read first: its on_reload arrays tell the glob entry which files it must
-            // not read a second time.
-            List<String> reloadPaths = readReloadPaths(resourceManager, namespace);
-            collectGlob(resourceManager, namespace, new HashSet<>(reloadPaths), globDefinitions, clipCandidates);
-            collectIndex(resourceManager, namespace, reloadPaths, indexDefinitions, clipCandidates);
+            collectNamespace(resourceManager, namespace, globDefinitions, indexDefinitions, clipCandidates);
         }
 
         // The unified order: every glob-discovered file first, then every on_reload-listed file.
@@ -189,6 +215,27 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
         // After both buckets are populated: a clip reference can only be judged once the clip files of
         // this cycle have landed, otherwise every reference would look dangling.
         validateClipReferences(registered);
+    }
+
+    /**
+     * Runs the two discoveries of one namespace. The per-file guard inside {@code readAndDispatch}
+     * already isolates a single content file, so what this guard catches is the discovery machinery
+     * itself — a directory glob or a manifest reader that throws. It is charged to the namespace it
+     * happened in, and the next namespace still runs.
+     */
+    private void collectNamespace(ResourceManager resourceManager, String namespace,
+                                  List<DuplicateIdResolver.Candidate> globDefinitions,
+                                  List<DuplicateIdResolver.Candidate> indexDefinitions,
+                                  List<DuplicateIdResolver.Candidate> clipCandidates) {
+        try {
+            // The index is read first: its on_reload arrays tell the glob entry which files it must
+            // not read a second time.
+            List<String> reloadPaths = readReloadPaths(resourceManager, namespace);
+            collectGlob(resourceManager, namespace, new HashSet<>(reloadPaths), globDefinitions, clipCandidates);
+            collectIndex(resourceManager, namespace, reloadPaths, indexDefinitions, clipCandidates);
+        } catch (RuntimeException e) {
+            reportError(namespace, "Failed to discover reload content for mod '" + namespace + "'", e);
+        }
     }
 
     /**
@@ -294,7 +341,17 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
                         + invalid);
                 continue;
             }
-            ResourceLocation loc = ResourceLocation.fromNamespaceAndPath(namespace, path);
+            // The shared contract checks relativity, the '.json' suffix and the segments, but not the
+            // character set of a resource location. Building the location directly would therefore
+            // throw on it (an uppercase path is still "valid" to the contract), so the location is
+            // built through the non-throwing factory and a refusal becomes one more isolated entry.
+            ResourceLocation loc = ResourceLocation.tryBuild(namespace, path);
+            if (loc == null) {
+                reportError(namespace, "Invalid 'on_reload' path '" + path + "' for mod '" + namespace
+                        + "': not a valid resource location (a path allows only [a-z0-9/._-] and a "
+                        + "namespace only [a-z0-9_.-])");
+                continue;
+            }
             Optional<Resource> resource = resourceManager.getResource(loc);
             if (resource.isEmpty()) {
                 reportError(namespace, "Source file not found for mod '" + namespace + "': data/"
@@ -305,7 +362,11 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
         }
     }
 
-    /** Reads and dispatches one content file; read failures become a paired diagnostic, never an exception. */
+    /**
+     * Reads and dispatches one content file. Read failures and decode failures both become a paired
+     * diagnostic, never an exception; the decode guard also covers a decoder that throws instead of
+     * returning its diagnostics, so one bad file can neither abort the batch nor the reload.
+     */
     private void readAndDispatch(String namespace, String label, String sourcePath, Resource resource,
                                  List<DuplicateIdResolver.Candidate> definitions,
                                  List<DuplicateIdResolver.Candidate> clips) {
@@ -313,6 +374,8 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
             dispatch(namespace, label, sourcePath, JsonParser.parseReader(reader), definitions, clips);
         } catch (IOException | JsonParseException e) {
             reportError(namespace, "Failed to read content file '" + label + "'", e);
+        } catch (RuntimeException e) {
+            reportError(namespace, "Failed to process content file '" + label + "'", e);
         }
     }
 
@@ -369,14 +432,22 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
 
     /**
      * Resolves duplicate ids among the definition candidates and registers the winners, returning the
-     * definitions that actually landed in the bucket so the clip check can run over exactly them.
+     * definitions that actually landed in the bucket so the clip check can run over exactly them. A
+     * registration that throws is charged to the entry's own namespace and skipped, so the remaining
+     * winners still land.
      */
     private List<LoadedDefinition> registerDefinitions(List<DuplicateIdResolver.Candidate> candidates) {
         List<LoadedDefinition> registered = new ArrayList<>();
         for (DuplicateIdResolver.Candidate winner : resolveAndReport(candidates)) {
             LoadedDefinition loaded = (LoadedDefinition) winner.payload();
             StateMachineDefinition definition = loaded.definition();
-            definitions.registerResource(definition.id(), definition);
+            try {
+                definitions.registerResource(definition.id(), definition);
+            } catch (RuntimeException e) {
+                reportError(loaded.modId(), "Failed to register state machine definition '"
+                        + definition.id() + "' from '" + winner.sourcePath() + "'", e);
+                continue;
+            }
             registered.add(loaded);
             LOGGER.info("Loaded state machine definition '{}' from '{}' (reload domain, mod '{}')",
                     definition.id(), winner.sourcePath(), loaded.modId());
@@ -388,13 +459,20 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
      * Registers the winning clip candidates into the reload bucket. {@link ClipSampler} is the sampler
      * for the {@link AnimationClip} data these files carry; a SCRIPT clip of the same id is left
      * untouched by {@link FsmAnimationClips#registerResource} ("script wins"), so a file can never
-     * shadow a clip a script registered.
+     * shadow a clip a script registered. A registration that throws is charged to the entry's own
+     * namespace and skipped, so the remaining winners still land.
      */
     private void registerClips(List<DuplicateIdResolver.Candidate> candidates) {
         for (DuplicateIdResolver.Candidate winner : resolveAndReport(candidates)) {
             LoadedClip loaded = (LoadedClip) winner.payload();
             AnimationClip clip = loaded.clip();
-            clips.registerResource(clip.id(), ClipSampler.INSTANCE, clip);
+            try {
+                clips.registerResource(clip.id(), ClipSampler.INSTANCE, clip);
+            } catch (RuntimeException e) {
+                reportError(loaded.modId(), "Failed to register animation clip '"
+                        + clip.id() + "' from '" + winner.sourcePath() + "'", e);
+                continue;
+            }
             LOGGER.info("Loaded animation clip '{}' from '{}' (reload domain, mod '{}')",
                     clip.id(), winner.sourcePath(), loaded.modId());
         }
@@ -426,7 +504,8 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
      * <p>Nothing is blocked, re-registered or degraded differently from the build-time behaviour: an
      * unresolved clip still falls back to the state's static pose. Only resource-loaded definitions are
      * checked; a script definition shadowing a same-id resource entry is not ours to judge, so the
-     * candidate is skipped when it is no longer the live entry in the bucket.
+     * candidate is skipped when it is no longer the live entry in the bucket. A check that throws is
+     * charged to the definition's namespace and skipped, so the remaining definitions are still checked.
      */
     private void validateClipReferences(List<LoadedDefinition> registered) {
         for (LoadedDefinition loaded : registered) {
@@ -434,11 +513,16 @@ public final class ReloadIndexLoader implements ScopedResourceManagerConsumer, S
             if (definitions.get(definition.id()) != definition) {
                 continue;
             }
-            List<String> missing = DefinitionStateMachineFactory.unknownClipReferences(definition, clips);
-            if (!missing.isEmpty()) {
-                reportWarning(loaded.modId(), "State machine definition '" + definition.id()
-                        + "' has unresolved clip references after reload: " + missing
-                        + "; the affected states degrade to their static pose");
+            try {
+                List<String> missing = DefinitionStateMachineFactory.unknownClipReferences(definition, clips);
+                if (!missing.isEmpty()) {
+                    reportWarning(loaded.modId(), "State machine definition '" + definition.id()
+                            + "' has unresolved clip references after reload: " + missing
+                            + "; the affected states degrade to their static pose");
+                }
+            } catch (RuntimeException e) {
+                reportError(loaded.modId(), "Failed to check the clip references of state machine definition '"
+                        + definition.id() + "' after reload", e);
             }
         }
     }
